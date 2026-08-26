@@ -19,11 +19,12 @@ data = response.json()
 
 print(data)
 
-message = "📡 Twelve Data test\n\n"
-
-if isinstance(data, dict):
-    for key in data.keys():
-        message += f"• {key}\n"
+message = (
+    "📡 **Twelve Data test**\n\n"
+    f"Code: {data.get('code')}\n"
+    f"Status: {data.get('status')}\n"
+    f"Message: {data.get('message')}\n"
+)
 
 requests.post(
     WEBHOOK,
