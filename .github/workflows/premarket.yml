@@ -18,8 +18,8 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Nainstalovat requests
-        run: pip install requests
+      - name: Nainstalovat knihovny
+        run: pip install requests beautifulsoup4
 
       - name: Spustit bot
         env:
