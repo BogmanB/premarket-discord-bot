@@ -1,0 +1,28 @@
+name: Premarket Discord Bot
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Po–Pá v 14:30 UTC
+    - cron: "30 14 * * 1-5"
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Stáhnout repository
+        uses: actions/checkout@v4
+
+      - name: Nastavit Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Nainstalovat requests
+        run: pip install requests
+
+      - name: Spustit bot
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: python main.py
