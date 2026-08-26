@@ -3,7 +3,6 @@ name: Premarket Discord Bot
 on:
   workflow_dispatch:
   schedule:
-    # Po–Pá v 14:30 UTC
     - cron: "30 14 * * 1-5"
 
 jobs:
@@ -11,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Stáhnout repository
+      - name: Stahnout repository
         uses: actions/checkout@v4
 
       - name: Nastavit Python
@@ -22,7 +21,7 @@ jobs:
       - name: Nainstalovat requests
         run: pip install requests
 
-         - name: Spustit bot
+      - name: Spustit bot
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
