@@ -1,33 +1,75 @@
-import os
 import requests
+from bs4 import BeautifulSoup
+import os
 
-TWELVE_KEY = os.environ["TWELVE_DATA_API_KEY"]
 WEBHOOK = os.environ["DISCORD_WEBHOOK"]
 
-url = "https://api.twelvedata.com/market_movers/stocks"
+URL = "https://stockanalysis.com/markets/premarket/gainers/"
+
+headers = {
+    "User-Agent": "Mozilla/5.0"
+}
 
 response = requests.get(
-    url,
-    params={
-        "apikey": TWELVE_KEY,
-        "country": "United States"
-    },
+    URL,
+    headers=headers,
     timeout=20
 )
 
-data = response.json()
+response.raise_for_status()
 
-print(data)
+soup = BeautifulSoup(response.text, "html.parser")
 
-message = (
-    "📡 **Twelve Data test**\n\n"
-    f"Code: {data.get('code')}\n"
-    f"Status: {data.get('status')}\n"
-    f"Message: {data.get('message')}\n"
-)
+table = soup.find("table")
+
+if not table:
+    raise Exception("Nenašel jsem tabulku s premarket gainery.")
+
+rows = table.find_all("tr")[1:]
+
+stocks = []
+
+for row in rows:
+    cols = row.find_all("td")
+
+    if len(cols) < 7:
+        continue
+
+    symbol = cols[1].get_text(strip=True)
+    company = cols[2].get_text(strip=True)
+    change = cols[3].get_text(strip=True)
+    price = cols[4].get_text(strip=True)
+    volume = cols[5].get_text(strip=True)
+    market_cap = cols[6].get_text(strip=True)
+
+    stocks.append({
+        "symbol": symbol,
+        "company": company,
+        "change": change,
+        "price": price,
+        "volume": volume,
+        "market_cap": market_cap
+    })
+
+top = stocks[:10]
+
+message = "🚀 **TOP PREMARKET GAINERS**\n\n"
+
+for i, stock in enumerate(top, start=1):
+
+    message += (
+        f"**{i}. {stock['symbol']}** — {stock['change']}\n"
+        f"💰 ${stock['price']} | "
+        f"📊 Vol: {stock['volume']} | "
+        f"🏢 MC: {stock['market_cap']}\n\n"
+    )
+
+message += "📡 Source: StockAnalysis"
 
 requests.post(
     WEBHOOK,
     json={"content": message[:1900]},
     timeout=15
 )
+
+print(message)
