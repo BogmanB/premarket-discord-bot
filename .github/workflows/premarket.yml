@@ -24,5 +24,6 @@ jobs:
 
       - name: Spustit bot
         env:
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+  DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+  FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
         run: python main.py
