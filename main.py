@@ -7,16 +7,27 @@ from bs4 import BeautifulSoup
 from pypdf import PdfReader
 
 
-# =========================
-# NASTAVENI
-# =========================
-
 WEBHOOK = os.environ["DISCORD_WEBHOOK"]
 
-STOCKANALYSIS_URL = "https://stockanalysis.com/markets/premarket/gainers/"
-
-# Aktualni oficialni XTB tabulka Stock CFD / ETF CFD
 XTB_PDF_URL = "https://www.xtb.com/int/equity-table-current.pdf"
+
+SOURCES = [
+    {
+        "name": "Premarket Gainers",
+        "url": "https://stockanalysis.com/markets/premarket/gainers/",
+        "type": "premarket"
+    },
+    {
+        "name": "Premarket Losers",
+        "url": "https://stockanalysis.com/markets/premarket/losers/",
+        "type": "premarket"
+    },
+    {
+        "name": "Most Active",
+        "url": "https://stockanalysis.com/markets/active/",
+        "type": "active"
+    }
+]
 
 TOP_COUNT = 10
 
@@ -28,17 +39,7 @@ HEADERS = {
 }
 
 
-# =========================
-# POMOCNE FUNKCE
-# =========================
-
 def parse_number(value):
-    """
-    Prevede napriklad:
-    23.5M -> 23 500 000
-    850K  -> 850 000
-    1.2B  -> 1 200 000 000
-    """
     if value is None:
         return 0
 
@@ -68,6 +69,10 @@ def parse_number(value):
         multiplier = 1_000_000_000
         text = text[:-1]
 
+    elif text.endswith("T"):
+        multiplier = 1_000_000_000_000
+        text = text[:-1]
+
     try:
         return float(text) * multiplier
     except ValueError:
@@ -87,192 +92,295 @@ def format_money(value):
     return f"${value:.0f}"
 
 
-# =========================
-# 1. NACIST XTB CFD TICKERY
-# =========================
+def format_volume(value):
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.2f}M"
 
-print("Stahuji XTB Stock CFD seznam...")
+    if value >= 1_000:
+        return f"{value / 1_000:.1f}K"
 
-xtb_response = requests.get(
-    XTB_PDF_URL,
-    headers=HEADERS,
-    timeout=30
-)
-
-xtb_response.raise_for_status()
-
-reader = PdfReader(io.BytesIO(xtb_response.content))
-
-xtb_text = ""
-
-for page in reader.pages:
-    page_text = page.extract_text()
-
-    if page_text:
-        xtb_text += "\n" + page_text
+    return f"{value:.0f}"
 
 
-# Hledame instrumenty typu:
-# NVDA.US
-# TSLA.US
-# AAPL.US
-#
-# a nechame jen zakladni ticker:
-# NVDA
-# TSLA
-# AAPL
+def load_xtb_symbols():
+    print("Stahuji XTB Stock CFD seznam...")
 
-xtb_symbols = set(
-    re.findall(
-        r"\b([A-Z0-9.-]+)\.US\b",
-        xtb_text
-    )
-)
-
-print(f"Nalezeno {len(xtb_symbols)} US CFD instrumentu na XTB.")
-
-
-if not xtb_symbols:
-    raise Exception(
-        "Nepodarilo se nacist zadne XTB US CFD tickery."
+    response = requests.get(
+        XTB_PDF_URL,
+        headers=HEADERS,
+        timeout=30
     )
 
+    response.raise_for_status()
 
-# =========================
-# 2. PREMARKET GAINERS
-# =========================
+    reader = PdfReader(io.BytesIO(response.content))
 
-print("Stahuji StockAnalysis premarket gainery...")
+    text = ""
 
-response = requests.get(
-    STOCKANALYSIS_URL,
-    headers=HEADERS,
-    timeout=20
-)
+    for page in reader.pages:
+        page_text = page.extract_text()
 
-response.raise_for_status()
+        if page_text:
+            text += "\n" + page_text
 
-soup = BeautifulSoup(
-    response.text,
-    "html.parser"
-)
+    symbols = set(
+        re.findall(
+            r"\b([A-Z0-9.-]+)\.US\b",
+            text
+        )
+    )
 
-table = soup.find("table")
+    print(f"Nalezeno {len(symbols)} US CFD instrumentu na XTB.")
 
-if not table:
-    raise Exception(
-        "Nenalezena tabulka s premarket gainery."
+    if not symbols:
+        raise Exception("Nepodarilo se nacist XTB CFD tickery.")
+
+    return symbols
+
+
+def load_stockanalysis(source):
+    print(f"Stahuji: {source['name']}")
+
+    response = requests.get(
+        source["url"],
+        headers=HEADERS,
+        timeout=20
+    )
+
+    response.raise_for_status()
+
+    soup = BeautifulSoup(
+        response.text,
+        "html.parser"
+    )
+
+    table = soup.find("table")
+
+    if not table:
+        print(f"WARNING: Nenalezena tabulka: {source['name']}")
+        return []
+
+    rows = table.find_all("tr")[1:]
+
+    results = []
+
+    for row in rows:
+        cols = row.find_all("td")
+
+        if len(cols) < 7:
+            continue
+
+        if source["type"] == "premarket":
+            symbol = cols[1].get_text(strip=True).upper()
+            company = cols[2].get_text(strip=True)
+            change_text = cols[3].get_text(strip=True)
+            price_text = cols[4].get_text(strip=True)
+            volume_text = cols[5].get_text(strip=True)
+            market_cap = cols[6].get_text(strip=True)
+
+        else:
+            symbol = cols[1].get_text(strip=True).upper()
+            company = cols[2].get_text(strip=True)
+            volume_text = cols[3].get_text(strip=True)
+            price_text = cols[4].get_text(strip=True)
+            change_text = cols[5].get_text(strip=True)
+            market_cap = cols[6].get_text(strip=True)
+
+        price = parse_number(price_text)
+        volume = parse_number(volume_text)
+        change = parse_number(change_text)
+
+        if price <= 0:
+            continue
+
+        traded_value = price * volume
+
+        results.append({
+            "symbol": symbol,
+            "company": company,
+            "change": change,
+            "change_text": change_text,
+            "price": price,
+            "volume": volume,
+            "market_cap": market_cap,
+            "traded_value": traded_value,
+            "source": source["name"]
+        })
+
+    print(f"{source['name']}: {len(results)} zaznamu")
+
+    return results
+
+
+xtb_symbols = load_xtb_symbols()
+
+all_stocks = {}
+
+for source in SOURCES:
+    stocks = load_stockanalysis(source)
+
+    for stock in stocks:
+        symbol = stock["symbol"]
+
+        if symbol not in xtb_symbols:
+            continue
+
+        if symbol not in all_stocks:
+            all_stocks[symbol] = stock
+        else:
+            existing = all_stocks[symbol]
+
+            # Pokud stejný ticker najdeme vícekrát,
+            # necháme variantu s vyšším traded value.
+            if stock["traded_value"] > existing["traded_value"]:
+                all_stocks[symbol] = stock
+
+
+stocks = list(all_stocks.values())
+
+print(f"Po XTB filtru: {len(stocks)} unikatnich tickeru")
+
+
+def score(stock):
+    """
+    Jednoduché skóre:
+    - pohyb ceny
+    - traded value
+    - volume
+    """
+
+    movement_score = min(abs(stock["change"]) * 3, 60)
+
+    traded = stock["traded_value"]
+
+    if traded >= 100_000_000:
+        liquidity_score = 30
+    elif traded >= 50_000_000:
+        liquidity_score = 25
+    elif traded >= 20_000_000:
+        liquidity_score = 20
+    elif traded >= 5_000_000:
+        liquidity_score = 15
+    elif traded >= 1_000_000:
+        liquidity_score = 10
+    else:
+        liquidity_score = 3
+
+    volume = stock["volume"]
+
+    if volume >= 10_000_000:
+        volume_score = 10
+    elif volume >= 1_000_000:
+        volume_score = 7
+    elif volume >= 250_000:
+        volume_score = 4
+    else:
+        volume_score = 1
+
+    return round(
+        movement_score +
+        liquidity_score +
+        volume_score
     )
 
 
-rows = table.find_all("tr")[1:]
-
-stocks = []
-
-
-for row in rows:
-
-    cols = row.find_all("td")
-
-    if len(cols) < 7:
-        continue
-
-    symbol = cols[1].get_text(strip=True).upper()
-    company = cols[2].get_text(strip=True)
-    change = cols[3].get_text(strip=True)
-    price_text = cols[4].get_text(strip=True)
-    volume_text = cols[5].get_text(strip=True)
-    market_cap = cols[6].get_text(strip=True)
-
-    # =========================
-    # XTB CFD FILTR
-    # =========================
-
-    if symbol not in xtb_symbols:
-        print(f"SKIP {symbol} - neni XTB CFD")
-        continue
+for stock in stocks:
+    stock["score"] = score(stock)
 
 
-    price = parse_number(price_text)
-    volume = parse_number(volume_text)
+stocks.sort(
+    key=lambda x: (
+        x["score"],
+        x["traded_value"]
+    ),
+    reverse=True
+)
 
-    traded_value = price * volume
-
-
-    stocks.append({
-        "symbol": symbol,
-        "company": company,
-        "change": change,
-        "price": price,
-        "price_text": price_text,
-        "volume": volume,
-        "volume_text": volume_text,
-        "market_cap": market_cap,
-        "traded_value": traded_value,
-    })
-
-
-# StockAnalysis uz gainery radi podle %
 top = stocks[:TOP_COUNT]
 
 
-# =========================
-# 3. DISCORD
-# =========================
-
 if not top:
-
     message = (
-        "⚠️ **XTB PREMARKET SCANNER**\n\n"
-        "Dnes nebyl mezi nactenymi premarket gainery "
-        "nalezen zadny titul dostupny jako XTB Stock CFD."
+        "⚠️ **XTB MARKET SCANNER**\n\n"
+        "Nenalezeny zadne relevantni XTB CFD tickery."
     )
 
 else:
-
     message = (
-        "🚀 **TOP XTB PREMARKET GAINERS**\n"
+        "🚀 **TOP 10 XTB MARKET MOVERS**\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n\n"
     )
 
-
     for i, stock in enumerate(top, start=1):
-
         symbol = stock["symbol"]
+
+        if stock["change"] > 0:
+            movement = f"🟢 +{stock['change']:.2f}%"
+        elif stock["change"] < 0:
+            movement = f"🔴 {stock['change']:.2f}%"
+        else:
+            movement = "⚪ 0.00%"
 
         tradingview = (
             f"https://www.tradingview.com/chart/?symbol={symbol}"
         )
 
         message += (
-            f"**{i}. {symbol} — {stock['change']}**\n"
+            f"**{i}. {symbol}** — {movement}\n"
             f"💰 Cena: ${stock['price']:.2f}\n"
-            f"📊 Volume: {stock['volume_text']}\n"
-            f"💵 Traded value: {format_money(stock['traded_value'])}\n"
+            f"📊 Volume: {format_volume(stock['volume'])}\n"
+            f"💵 Traded: {format_money(stock['traded_value'])}\n"
             f"🏢 Market cap: {stock['market_cap']}\n"
+            f"🔥 Score: **{stock['score']}/100**\n"
+            f"📡 {stock['source']}\n"
             f"📈 [TradingView]({tradingview})\n\n"
         )
-
 
     message += (
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "🏦 XTB Stock CFD only\n"
-        "📡 Premarket: StockAnalysis"
+        "📊 StockAnalysis"
     )
 
 
-# Discord limit je 2000 znaku
-message = message[:1950]
+# Discord má limit 2000 znaků.
+# Když by zpráva byla moc dlouhá,
+# rozdělíme ji na části.
+
+MAX_LENGTH = 1900
+
+parts = []
+
+while len(message) > MAX_LENGTH:
+    split_at = message.rfind("\n\n", 0, MAX_LENGTH)
+
+    if split_at == -1:
+        split_at = MAX_LENGTH
+
+    parts.append(message[:split_at])
+    message = message[split_at:].lstrip()
+
+parts.append(message)
 
 
-discord_response = requests.post(
-    WEBHOOK,
-    json={"content": message},
-    timeout=15
-)
+for part in parts:
+    discord_response = requests.post(
+        WEBHOOK,
+        json={"content": part},
+        timeout=15
+    )
 
-discord_response.raise_for_status()
+    discord_response.raise_for_status()
 
 
-print("\n===== DISCORD MESSAGE =====")
-print(message)
+print("\n===== TOP STOCKS =====")
+
+for stock in top:
+    print(
+        stock["symbol"],
+        stock["change"],
+        stock["volume"],
+        stock["traded_value"],
+        stock["score"],
+        stock["source"]
+    )
