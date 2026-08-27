@@ -7,27 +7,16 @@ from bs4 import BeautifulSoup
 from pypdf import PdfReader
 
 
+# =========================
+# NASTAVENI
+# =========================
+
 WEBHOOK = os.environ["DISCORD_WEBHOOK"]
 
 XTB_PDF_URL = "https://www.xtb.com/int/equity-table-current.pdf"
 
-SOURCES = [
-    {
-        "name": "Premarket Gainers",
-        "url": "https://stockanalysis.com/markets/premarket/gainers/",
-        "type": "premarket"
-    },
-    {
-        "name": "Premarket Losers",
-        "url": "https://stockanalysis.com/markets/premarket/losers/",
-        "type": "premarket"
-    },
-    {
-        "name": "Most Active",
-        "url": "https://stockanalysis.com/markets/active/",
-        "type": "active"
-    }
-]
+GAINERS_URL = "https://stockanalysis.com/markets/premarket/gainers/"
+LOSERS_URL = "https://stockanalysis.com/markets/premarket/losers/"
 
 TOP_COUNT = 10
 
@@ -38,6 +27,10 @@ HEADERS = {
     )
 }
 
+
+# =========================
+# POMOCNE FUNKCE
+# =========================
 
 def parse_number(value):
     if value is None:
@@ -84,7 +77,7 @@ def format_money(value):
         return f"${value / 1_000_000_000:.2f}B"
 
     if value >= 1_000_000:
-        return f"${value / 1_000_000:.2f}M"
+        return f"${value / 1_000_000:.1f}M"
 
     if value >= 1_000:
         return f"${value / 1_000:.1f}K"
@@ -93,16 +86,101 @@ def format_money(value):
 
 
 def format_volume(value):
+    if value >= 1_000_000_000:
+        return f"{value / 1_000_000_000:.2f}B"
+
     if value >= 1_000_000:
-        return f"{value / 1_000_000:.2f}M"
+        return f"{value / 1_000_000:.1f}M"
 
     if value >= 1_000:
-        return f"{value / 1_000:.1f}K"
+        return f"{value / 1_000:.0f}K"
 
     return f"{value:.0f}"
 
 
+# =========================
+# TRADE SCORE
+# =========================
+
+def calculate_score(stock):
+    """
+    Score 0-100.
+
+    Hodnotime:
+    45 bodu = velikost pohybu
+    35 bodu = traded value / likvidita
+    20 bodu = volume
+
+    Neni to doporuceni BUY/SELL.
+    Je to priorita, na co se podivat.
+    """
+
+    movement = abs(stock["change"])
+    traded = stock["traded_value"]
+    volume = stock["volume"]
+
+    # 0-45 bodu za pohyb
+    if movement >= 20:
+        movement_score = 45
+    elif movement >= 15:
+        movement_score = 40
+    elif movement >= 10:
+        movement_score = 35
+    elif movement >= 7:
+        movement_score = 28
+    elif movement >= 5:
+        movement_score = 22
+    elif movement >= 3:
+        movement_score = 15
+    else:
+        movement_score = 7
+
+    # 0-35 bodu za zobchodovanou hodnotu
+    if traded >= 500_000_000:
+        traded_score = 35
+    elif traded >= 200_000_000:
+        traded_score = 32
+    elif traded >= 100_000_000:
+        traded_score = 29
+    elif traded >= 50_000_000:
+        traded_score = 25
+    elif traded >= 20_000_000:
+        traded_score = 20
+    elif traded >= 5_000_000:
+        traded_score = 14
+    elif traded >= 1_000_000:
+        traded_score = 8
+    else:
+        traded_score = 3
+
+    # 0-20 bodu za volume
+    if volume >= 20_000_000:
+        volume_score = 20
+    elif volume >= 10_000_000:
+        volume_score = 18
+    elif volume >= 5_000_000:
+        volume_score = 16
+    elif volume >= 1_000_000:
+        volume_score = 13
+    elif volume >= 500_000:
+        volume_score = 10
+    elif volume >= 100_000:
+        volume_score = 6
+    else:
+        volume_score = 2
+
+    return min(
+        movement_score + traded_score + volume_score,
+        100
+    )
+
+
+# =========================
+# XTB CFD SEZNAM
+# =========================
+
 def load_xtb_symbols():
+
     print("Stahuji XTB Stock CFD seznam...")
 
     response = requests.get(
@@ -130,19 +208,28 @@ def load_xtb_symbols():
         )
     )
 
-    print(f"Nalezeno {len(symbols)} US CFD instrumentu na XTB.")
+    print(
+        f"Nalezeno {len(symbols)} US CFD instrumentu na XTB."
+    )
 
     if not symbols:
-        raise Exception("Nepodarilo se nacist XTB CFD tickery.")
+        raise Exception(
+            "Nepodarilo se nacist XTB US CFD tickery."
+        )
 
     return symbols
 
 
-def load_stockanalysis(source):
-    print(f"Stahuji: {source['name']}")
+# =========================
+# STOCKANALYSIS
+# =========================
+
+def load_movers(url, direction, xtb_symbols):
+
+    print(f"Stahuji {direction}...")
 
     response = requests.get(
-        source["url"],
+        url,
         headers=HEADERS,
         timeout=20
     )
@@ -157,230 +244,212 @@ def load_stockanalysis(source):
     table = soup.find("table")
 
     if not table:
-        print(f"WARNING: Nenalezena tabulka: {source['name']}")
-        return []
+        raise Exception(
+            f"Nenalezena tabulka pro {direction}."
+        )
 
     rows = table.find_all("tr")[1:]
 
-    results = []
+    stocks = []
 
     for row in rows:
+
         cols = row.find_all("td")
 
         if len(cols) < 7:
             continue
 
-        if source["type"] == "premarket":
-            symbol = cols[1].get_text(strip=True).upper()
-            company = cols[2].get_text(strip=True)
-            change_text = cols[3].get_text(strip=True)
-            price_text = cols[4].get_text(strip=True)
-            volume_text = cols[5].get_text(strip=True)
-            market_cap = cols[6].get_text(strip=True)
+        symbol = cols[1].get_text(strip=True).upper()
+        company = cols[2].get_text(strip=True)
+        change_text = cols[3].get_text(strip=True)
+        price_text = cols[4].get_text(strip=True)
+        volume_text = cols[5].get_text(strip=True)
+        market_cap = cols[6].get_text(strip=True)
 
+        if symbol not in xtb_symbols:
+            print(
+                f"SKIP {symbol} - neni XTB CFD"
+            )
+            continue
+
+        change = parse_number(change_text)
+
+        # U loseru muze parser vratit kladne cislo,
+        # proto smer pojistime.
+        if direction == "losers":
+            change = -abs(change)
         else:
-            symbol = cols[1].get_text(strip=True).upper()
-            company = cols[2].get_text(strip=True)
-            volume_text = cols[3].get_text(strip=True)
-            price_text = cols[4].get_text(strip=True)
-            change_text = cols[5].get_text(strip=True)
-            market_cap = cols[6].get_text(strip=True)
+            change = abs(change)
 
         price = parse_number(price_text)
         volume = parse_number(volume_text)
-        change = parse_number(change_text)
 
         if price <= 0:
             continue
 
         traded_value = price * volume
 
-        results.append({
+        stock = {
             "symbol": symbol,
             "company": company,
             "change": change,
-            "change_text": change_text,
             "price": price,
             "volume": volume,
             "market_cap": market_cap,
-            "traded_value": traded_value,
-            "source": source["name"]
-        })
+            "traded_value": traded_value
+        }
 
-    print(f"{source['name']}: {len(results)} zaznamu")
+        stock["score"] = calculate_score(stock)
 
-    return results
+        stocks.append(stock)
 
+    print(
+        f"{direction}: {len(stocks)} XTB tickeru"
+    )
+
+    return stocks
+
+
+# =========================
+# NACIST DATA
+# =========================
 
 xtb_symbols = load_xtb_symbols()
 
-all_stocks = {}
-
-for source in SOURCES:
-    stocks = load_stockanalysis(source)
-
-    for stock in stocks:
-        symbol = stock["symbol"]
-
-        if symbol not in xtb_symbols:
-            continue
-
-        if symbol not in all_stocks:
-            all_stocks[symbol] = stock
-        else:
-            existing = all_stocks[symbol]
-
-            # Pokud stejný ticker najdeme vícekrát,
-            # necháme variantu s vyšším traded value.
-            if stock["traded_value"] > existing["traded_value"]:
-                all_stocks[symbol] = stock
-
-
-stocks = list(all_stocks.values())
-
-print(f"Po XTB filtru: {len(stocks)} unikatnich tickeru")
-
-
-def score(stock):
-    """
-    Jednoduché skóre:
-    - pohyb ceny
-    - traded value
-    - volume
-    """
-
-    movement_score = min(abs(stock["change"]) * 3, 60)
-
-    traded = stock["traded_value"]
-
-    if traded >= 100_000_000:
-        liquidity_score = 30
-    elif traded >= 50_000_000:
-        liquidity_score = 25
-    elif traded >= 20_000_000:
-        liquidity_score = 20
-    elif traded >= 5_000_000:
-        liquidity_score = 15
-    elif traded >= 1_000_000:
-        liquidity_score = 10
-    else:
-        liquidity_score = 3
-
-    volume = stock["volume"]
-
-    if volume >= 10_000_000:
-        volume_score = 10
-    elif volume >= 1_000_000:
-        volume_score = 7
-    elif volume >= 250_000:
-        volume_score = 4
-    else:
-        volume_score = 1
-
-    return round(
-        movement_score +
-        liquidity_score +
-        volume_score
-    )
-
-
-for stock in stocks:
-    stock["score"] = score(stock)
-
-
-stocks.sort(
-    key=lambda x: (
-        x["score"],
-        x["traded_value"]
-    ),
-    reverse=True
+gainers = load_movers(
+    GAINERS_URL,
+    "gainers",
+    xtb_symbols
 )
 
-top = stocks[:TOP_COUNT]
+losers = load_movers(
+    LOSERS_URL,
+    "losers",
+    xtb_symbols
+)
 
 
-if not top:
-    message = (
-        "⚠️ **XTB MARKET SCANNER**\n\n"
-        "Nenalezeny zadne relevantni XTB CFD tickery."
-    )
+# StockAnalysis je uz serazeny podle pohybu.
+# Nechame TOP 10 XTB z kazde strany.
 
-else:
-    message = (
-        "🚀 **TOP 10 XTB MARKET MOVERS**\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-    )
+top_gainers = gainers[:TOP_COUNT]
+top_losers = losers[:TOP_COUNT]
 
-    for i, stock in enumerate(top, start=1):
+
+# =========================
+# DISCORD SLOUPCE
+# =========================
+
+def build_column(stocks, emoji):
+
+    if not stocks:
+        return "Dnes nic."
+
+    lines = []
+
+    for i, stock in enumerate(stocks, start=1):
+
         symbol = stock["symbol"]
 
-        if stock["change"] > 0:
-            movement = f"🟢 +{stock['change']:.2f}%"
-        elif stock["change"] < 0:
-            movement = f"🔴 {stock['change']:.2f}%"
-        else:
-            movement = "⚪ 0.00%"
-
         tradingview = (
-            f"https://www.tradingview.com/chart/?symbol={symbol}"
+            f"https://www.tradingview.com/chart/"
+            f"?symbol={symbol}"
         )
 
-        message += (
-            f"**{i}. {symbol}** — {movement}\n"
-            f"💰 Cena: ${stock['price']:.2f}\n"
-            f"📊 Volume: {format_volume(stock['volume'])}\n"
-            f"💵 Traded: {format_money(stock['traded_value'])}\n"
-            f"🏢 Market cap: {stock['market_cap']}\n"
-            f"🔥 Score: **{stock['score']}/100**\n"
-            f"📡 {stock['source']}\n"
-            f"📈 [TradingView]({tradingview})\n\n"
+        sign = "+" if stock["change"] > 0 else ""
+
+        line = (
+            f"**{i}. [{symbol}]({tradingview})** "
+            f"`{sign}{stock['change']:.2f}%`\n"
+            f"{emoji} ${stock['price']:.2f} | "
+            f"Vol {format_volume(stock['volume'])}\n"
+            f"💵 {format_money(stock['traded_value'])} | "
+            f"🔥 {stock['score']}/100"
         )
 
-    message += (
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🏦 XTB Stock CFD only\n"
-        "📊 StockAnalysis"
-    )
+        lines.append(line)
+
+    text = "\n\n".join(lines)
+
+    # Discord field ma limit 1024 znaku.
+    return text[:1020]
 
 
-# Discord má limit 2000 znaků.
-# Když by zpráva byla moc dlouhá,
-# rozdělíme ji na části.
+gainers_text = build_column(
+    top_gainers,
+    "🟢"
+)
 
-MAX_LENGTH = 1900
-
-parts = []
-
-while len(message) > MAX_LENGTH:
-    split_at = message.rfind("\n\n", 0, MAX_LENGTH)
-
-    if split_at == -1:
-        split_at = MAX_LENGTH
-
-    parts.append(message[:split_at])
-    message = message[split_at:].lstrip()
-
-parts.append(message)
+losers_text = build_column(
+    top_losers,
+    "🔴"
+)
 
 
-for part in parts:
-    discord_response = requests.post(
-        WEBHOOK,
-        json={"content": part},
-        timeout=15
-    )
+embed = {
+    "title": "📊 XTB PREMARKET SCANNER",
+    "description": (
+        "Premarket movers dostupne jako **XTB Stock CFD**.\n"
+        "Kliknutim na ticker otevres TradingView."
+    ),
+    "fields": [
+        {
+            "name": "🟢 TOP GAINERS",
+            "value": gainers_text,
+            "inline": True
+        },
+        {
+            "name": "🔴 TOP LOSERS",
+            "value": losers_text,
+            "inline": True
+        }
+    ],
+    "footer": {
+        "text": (
+            "StockAnalysis • XTB CFD filter • "
+            "Trade Score = movement + liquidity + volume"
+        )
+    }
+}
 
-    discord_response.raise_for_status()
+
+payload = {
+    "embeds": [embed]
+}
 
 
-print("\n===== TOP STOCKS =====")
+discord_response = requests.post(
+    WEBHOOK,
+    json=payload,
+    timeout=15
+)
 
-for stock in top:
+discord_response.raise_for_status()
+
+
+# =========================
+# LOG
+# =========================
+
+print("\n===== GAINERS =====")
+
+for stock in top_gainers:
     print(
         stock["symbol"],
         stock["change"],
         stock["volume"],
         stock["traded_value"],
-        stock["score"],
-        stock["source"]
+        stock["score"]
+    )
+
+
+print("\n===== LOSERS =====")
+
+for stock in top_losers:
+    print(
+        stock["symbol"],
+        stock["change"],
+        stock["volume"],
+        stock["traded_value"],
+        stock["score"]
     )
