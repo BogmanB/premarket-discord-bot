@@ -5,6 +5,7 @@ import requests
 
 from bs4 import BeautifulSoup
 from pypdf import PdfReader
+from news import get_news_display
 
 
 # =========================
@@ -68,6 +69,7 @@ def parse_number(value):
 
     try:
         return float(text) * multiplier
+
     except ValueError:
         return 0
 
@@ -104,14 +106,14 @@ def format_volume(value):
 
 def calculate_score(stock):
     """
-    Score 0-100.
+    Trade Score 0-100.
 
     Hodnotime:
     45 bodu = velikost pohybu
     35 bodu = traded value / likvidita
     20 bodu = volume
 
-    Neni to doporuceni BUY/SELL.
+    Neni to BUY/SELL signal.
     Je to priorita, na co se podivat.
     """
 
@@ -119,58 +121,79 @@ def calculate_score(stock):
     traded = stock["traded_value"]
     volume = stock["volume"]
 
-    # 0-45 bodu za pohyb
+    # Pohyb 0-45
     if movement >= 20:
         movement_score = 45
+
     elif movement >= 15:
         movement_score = 40
+
     elif movement >= 10:
         movement_score = 35
+
     elif movement >= 7:
         movement_score = 28
+
     elif movement >= 5:
         movement_score = 22
+
     elif movement >= 3:
         movement_score = 15
+
     else:
         movement_score = 7
 
-    # 0-35 bodu za zobchodovanou hodnotu
+    # Traded value 0-35
     if traded >= 500_000_000:
         traded_score = 35
+
     elif traded >= 200_000_000:
         traded_score = 32
+
     elif traded >= 100_000_000:
         traded_score = 29
+
     elif traded >= 50_000_000:
         traded_score = 25
+
     elif traded >= 20_000_000:
         traded_score = 20
+
     elif traded >= 5_000_000:
         traded_score = 14
+
     elif traded >= 1_000_000:
         traded_score = 8
+
     else:
         traded_score = 3
 
-    # 0-20 bodu za volume
+    # Volume 0-20
     if volume >= 20_000_000:
         volume_score = 20
+
     elif volume >= 10_000_000:
         volume_score = 18
+
     elif volume >= 5_000_000:
         volume_score = 16
+
     elif volume >= 1_000_000:
         volume_score = 13
+
     elif volume >= 500_000:
         volume_score = 10
+
     elif volume >= 100_000:
         volume_score = 6
+
     else:
         volume_score = 2
 
     return min(
-        movement_score + traded_score + volume_score,
+        movement_score
+        + traded_score
+        + volume_score,
         100
     )
 
@@ -191,11 +214,14 @@ def load_xtb_symbols():
 
     response.raise_for_status()
 
-    reader = PdfReader(io.BytesIO(response.content))
+    reader = PdfReader(
+        io.BytesIO(response.content)
+    )
 
     text = ""
 
     for page in reader.pages:
+
         page_text = page.extract_text()
 
         if page_text:
@@ -259,35 +285,65 @@ def load_movers(url, direction, xtb_symbols):
         if len(cols) < 7:
             continue
 
-        symbol = cols[1].get_text(strip=True).upper()
-        company = cols[2].get_text(strip=True)
-        change_text = cols[3].get_text(strip=True)
-        price_text = cols[4].get_text(strip=True)
-        volume_text = cols[5].get_text(strip=True)
-        market_cap = cols[6].get_text(strip=True)
+        symbol = (
+            cols[1]
+            .get_text(strip=True)
+            .upper()
+        )
 
+        company = cols[2].get_text(
+            strip=True
+        )
+
+        change_text = cols[3].get_text(
+            strip=True
+        )
+
+        price_text = cols[4].get_text(
+            strip=True
+        )
+
+        volume_text = cols[5].get_text(
+            strip=True
+        )
+
+        market_cap = cols[6].get_text(
+            strip=True
+        )
+
+        # XTB CFD filtr
         if symbol not in xtb_symbols:
+
             print(
                 f"SKIP {symbol} - neni XTB CFD"
             )
+
             continue
 
-        change = parse_number(change_text)
+        change = parse_number(
+            change_text
+        )
 
-        # U loseru muze parser vratit kladne cislo,
-        # proto smer pojistime.
         if direction == "losers":
             change = -abs(change)
+
         else:
             change = abs(change)
 
-        price = parse_number(price_text)
-        volume = parse_number(volume_text)
+        price = parse_number(
+            price_text
+        )
+
+        volume = parse_number(
+            volume_text
+        )
 
         if price <= 0:
             continue
 
-        traded_value = price * volume
+        traded_value = (
+            price * volume
+        )
 
         stock = {
             "symbol": symbol,
@@ -299,18 +355,19 @@ def load_movers(url, direction, xtb_symbols):
             "traded_value": traded_value
         }
 
-        stock["score"] = calculate_score(stock)
+        stock["score"] = (
+            calculate_score(stock)
+        )
 
         stocks.append(stock)
 
     print(
-        f"{direction}: {len(stocks)} XTB tickeru"
+        f"{direction}: "
+        f"{len(stocks)} XTB tickeru"
     )
 
     return stocks
-
-
-# =========================
+    # =========================
 # NACIST DATA
 # =========================
 
@@ -328,103 +385,325 @@ losers = load_movers(
     xtb_symbols
 )
 
-
-# StockAnalysis je uz serazeny podle pohybu.
-# Nechame TOP 10 XTB z kazde strany.
-
 top_gainers = gainers[:TOP_COUNT]
 top_losers = losers[:TOP_COUNT]
 
 
 # =========================
-# DISCORD SLOUPCE
+# NEWS ENRICHMENT
 # =========================
 
-def build_column(stocks, emoji):
+def enrich_with_news(stocks):
+    """
+    Ke kazde akcii prida nejcerstvejsi Finnhub zpravu.
+    """
 
-    if not stocks:
-        return "Dnes nic."
+    enriched = []
 
-    lines = []
-
-    for i, stock in enumerate(stocks, start=1):
-
+    for stock in stocks:
         symbol = stock["symbol"]
 
-        tradingview = (
-            f"https://www.tradingview.com/chart/"
-            f"?symbol={symbol}"
-        )
+        print(f"Nacitam news pro {symbol}...")
 
-        sign = "+" if stock["change"] > 0 else ""
+        news = get_news_display(symbol)
 
-        line = (
-            f"**{i}. [{symbol}]({tradingview})** "
-            f"`{sign}{stock['change']:.2f}%`\n"
-            f"{emoji} ${stock['price']:.2f} | "
-            f"Vol {format_volume(stock['volume'])}\n"
-            f"💵 {format_money(stock['traded_value'])} | "
-            f"🔥 {stock['score']}/100"
-        )
+        stock["news"] = news
 
-        lines.append(line)
+        enriched.append(stock)
 
-    text = "\n\n".join(lines)
-
-    # Discord field ma limit 1024 znaku.
-    return text[:1020]
+    return enriched
 
 
-gainers_text = build_column(
-    top_gainers,
-    "🟢"
+top_gainers = enrich_with_news(
+    top_gainers
 )
 
-losers_text = build_column(
-    top_losers,
-    "🔴"
+top_losers = enrich_with_news(
+    top_losers
 )
 
 
-embed = {
-    "title": "📊 XTB PREMARKET SCANNER",
-    "description": (
-        "Premarket movers dostupne jako **XTB Stock CFD**.\n"
-        "Kliknutim na ticker otevres TradingView."
-    ),
-    "fields": [
+# =========================
+# DISCORD EMBED PRO AKCII
+# =========================
+
+def build_stock_embed(stock, direction):
+
+    symbol = stock["symbol"]
+
+    tradingview = (
+        f"https://www.tradingview.com/chart/"
+        f"?symbol={symbol}"
+    )
+
+    change = stock["change"]
+
+    if change > 0:
+        movement = f"+{change:.2f}%"
+        emoji = "🟢"
+        label = "GAINER"
+
+    else:
+        movement = f"{change:.2f}%"
+        emoji = "🔴"
+        label = "LOSER"
+
+    news = stock.get("news")
+
+    fields = [
         {
-            "name": "🟢 TOP GAINERS",
-            "value": gainers_text,
+            "name": "Premarket",
+            "value": f"**{movement}**",
             "inline": True
         },
         {
-            "name": "🔴 TOP LOSERS",
-            "value": losers_text,
+            "name": "Cena",
+            "value": f"${stock['price']:.2f}",
+            "inline": True
+        },
+        {
+            "name": "Trade Score",
+            "value": f"🔥 **{stock['score']}/100**",
+            "inline": True
+        },
+        {
+            "name": "Volume",
+            "value": format_volume(
+                stock["volume"]
+            ),
+            "inline": True
+        },
+        {
+            "name": "Traded value",
+            "value": format_money(
+                stock["traded_value"]
+            ),
+            "inline": True
+        },
+        {
+            "name": "Market cap",
+            "value": stock["market_cap"],
             "inline": True
         }
-    ],
+    ]
+
+    # =========================
+    # NEWS
+    # =========================
+
+    if news:
+
+        headline = news.get(
+            "headline",
+            "Bez titulku"
+        )
+
+        source = news.get(
+            "source",
+            ""
+        )
+
+        time_text = news.get(
+            "time",
+            ""
+        )
+
+        news_url = news.get(
+            "url",
+            ""
+        )
+
+        summary = news.get(
+            "summary",
+            ""
+        )
+
+        # Omezime delku kvuli Discord limitum
+        if len(headline) > 220:
+            headline = (
+                headline[:217] + "..."
+            )
+
+        if len(summary) > 450:
+            summary = (
+                summary[:447] + "..."
+            )
+
+        if news_url:
+            news_title = (
+                f"[{headline}]({news_url})"
+            )
+        else:
+            news_title = headline
+
+        news_text = news_title
+
+        if source or time_text:
+            news_text += "\n"
+
+            if source:
+                news_text += f"📰 {source}"
+
+            if time_text:
+                if source:
+                    news_text += " • "
+
+                news_text += time_text
+
+        if summary:
+            news_text += (
+                f"\n\n{summary}"
+            )
+
+        fields.append({
+            "name": "📰 Posledni zprava",
+            "value": news_text[:1000],
+            "inline": False
+        })
+
+    else:
+
+        fields.append({
+            "name": "📰 Posledni zprava",
+            "value": (
+                "Finnhub nenasel zadnou "
+                "cerstvou firemni zpravu."
+            ),
+            "inline": False
+        })
+
+
+    fields.append({
+        "name": "📈 Graf",
+        "value": (
+            f"[Otevrit {symbol} "
+            f"na TradingView]({tradingview})"
+        ),
+        "inline": False
+    })
+
+
+    embed = {
+        "title": (
+            f"{emoji} {symbol} • {label} "
+            f"• {movement}"
+        ),
+        "description": (
+            f"**{stock['company']}**"
+        ),
+        "fields": fields,
+        "footer": {
+            "text": (
+                "XTB Stock CFD • "
+                "Premarket: StockAnalysis • "
+                "News: Finnhub"
+            )
+        }
+    }
+
+    return embed
+
+
+# =========================
+# UVODNI EMBED
+# =========================
+
+summary_embed = {
+    "title": "📊 XTB PREMARKET SCANNER",
+    "description": (
+        "Dnesni premarket pohyby dostupne "
+        "jako **XTB Stock CFD**.\n\n"
+        f"🟢 Gainers: **{len(top_gainers)}**\n"
+        f"🔴 Losers: **{len(top_losers)}**\n\n"
+        "Trade Score neni BUY/SELL signal. "
+        "Slouzi jako priorita pro dalsi analyzu."
+    ),
     "footer": {
         "text": (
-            "StockAnalysis • XTB CFD filter • "
-            "Trade Score = movement + liquidity + volume"
+            "Klikni na TradingView nebo "
+            "na titulek zpravy pro detail."
         )
     }
 }
 
 
-payload = {
-    "embeds": [embed]
-}
+# =========================
+# VYTVORIT EMBEDY
+# =========================
+
+embeds = [summary_embed]
 
 
-discord_response = requests.post(
-    WEBHOOK,
-    json=payload,
-    timeout=15
-)
+# Nejdřív gainers
+for stock in top_gainers:
 
-discord_response.raise_for_status()
+    embeds.append(
+        build_stock_embed(
+            stock,
+            "gainer"
+        )
+    )
+
+
+# Potom losers
+for stock in top_losers:
+
+    embeds.append(
+        build_stock_embed(
+            stock,
+            "loser"
+        )
+    )
+
+
+# =========================
+# DISCORD MA LIMIT MAX 10 EMBEDU
+# NA JEDNU ZPRAVU
+# =========================
+
+MAX_EMBEDS = 10
+
+chunks = []
+
+for i in range(
+    0,
+    len(embeds),
+    MAX_EMBEDS
+):
+
+    chunks.append(
+        embeds[
+            i:
+            i + MAX_EMBEDS
+        ]
+    )
+
+
+# =========================
+# POSLAT NA DISCORD
+# =========================
+
+for index, chunk in enumerate(
+    chunks,
+    start=1
+):
+
+    payload = {
+        "embeds": chunk
+    }
+
+    discord_response = requests.post(
+        WEBHOOK,
+        json=payload,
+        timeout=20
+    )
+
+    discord_response.raise_for_status()
+
+    print(
+        f"Discord zprava "
+        f"{index}/{len(chunks)} odeslana."
+    )
 
 
 # =========================
@@ -434,22 +713,34 @@ discord_response.raise_for_status()
 print("\n===== GAINERS =====")
 
 for stock in top_gainers:
+
+    news = stock.get("news")
+
     print(
         stock["symbol"],
         stock["change"],
-        stock["volume"],
-        stock["traded_value"],
-        stock["score"]
+        stock["score"],
+        (
+            news["headline"]
+            if news
+            else "NO NEWS"
+        )
     )
 
 
 print("\n===== LOSERS =====")
 
 for stock in top_losers:
+
+    news = stock.get("news")
+
     print(
         stock["symbol"],
         stock["change"],
-        stock["volume"],
-        stock["traded_value"],
-        stock["score"]
+        stock["score"],
+        (
+            news["headline"]
+            if news
+            else "NO NEWS"
+        )
     )
